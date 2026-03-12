@@ -24,6 +24,31 @@ VARIABLES = ["uo", "vo"]
 MS_TO_KNOTS = 1.94384
 
 
+def _get_credentials() -> tuple[str, str]:
+    """Resolve Copernicus Marine credentials from env or Streamlit secrets."""
+    username = os.environ.get("COPERNICUSMARINE_SERVICE_USERNAME", "")
+    password = os.environ.get("COPERNICUSMARINE_SERVICE_PASSWORD", "")
+    # Also check our own env var names
+    if not username:
+        username = os.environ.get("COPERNICUS_USERNAME", "")
+    if not password:
+        password = os.environ.get("COPERNICUS_PASSWORD", "")
+    # Try Streamlit secrets
+    if not username or not password:
+        try:
+            import streamlit as st
+            username = username or st.secrets.get("COPERNICUS_USERNAME", "")
+            password = password or st.secrets.get("COPERNICUS_PASSWORD", "")
+        except Exception:
+            pass
+    if not username or not password:
+        raise RuntimeError(
+            "Copernicus Marine credentials not set. "
+            "Put COPERNICUS_USERNAME and COPERNICUS_PASSWORD in .env or Streamlit secrets."
+        )
+    return username, password
+
+
 # ---------------------------------------------------------------------------
 # Fetch current data via copernicusmarine
 # ---------------------------------------------------------------------------
@@ -35,24 +60,29 @@ def fetch_currents(
     max_lat: float,
     start_date: str,
     end_date: str,
-    dataset_id: str = HOURLY_DATASET,
+    dataset_id: str = DAILY_DATASET,
     max_depth: float = 5.0,
     output_dir: str = "data/cache",
 ) -> xr.Dataset:
     """
     Fetch ocean-current data for a bounding box and time range.
 
-    Tries `open_dataset` first (lazy OPeNDAP streaming — no download).
-    Falls back to `subset` (downloads a NetCDF file) if open_dataset fails.
+    Uses daily data by default (sufficient for current assessment and
+    much faster than hourly).  Passes credentials explicitly to avoid
+    interactive prompts.
 
     Returns an xarray Dataset with variables uo, vo.
     """
     import copernicusmarine
 
+    username, password = _get_credentials()
+
     try:
         ds = copernicusmarine.open_dataset(
             dataset_id=dataset_id,
             variables=VARIABLES,
+            username=username,
+            password=password,
             minimum_longitude=min_lon,
             maximum_longitude=max_lon,
             minimum_latitude=min_lat,
@@ -62,6 +92,8 @@ def fetch_currents(
             minimum_depth=0,
             maximum_depth=max_depth,
         )
+        # Force-load into memory so we don't hold an open remote connection
+        ds = ds.load()
         return ds
     except Exception:
         pass
@@ -78,6 +110,8 @@ def fetch_currents(
         copernicusmarine.subset(
             dataset_id=dataset_id,
             variables=VARIABLES,
+            username=username,
+            password=password,
             minimum_longitude=min_lon,
             maximum_longitude=max_lon,
             minimum_latitude=min_lat,

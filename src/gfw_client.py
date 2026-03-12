@@ -12,14 +12,16 @@ import httpx
 
 GFW_BASE = "https://gateway.api.globalfishingwatch.org/v3"
 PORT_VISIT_DATASET = "public-global-port-visits-events:latest"
-PAGE_SIZE = 200  # events per page (GFW allows up to 99999 but large pages are slow)
-MAX_EVENTS = 2000  # safety cap on total events to avoid endless fetching
+# We request ALL results in a single API call (no pagination).
+# GFW allows limit up to 99999.  A single large request is much faster
+# than multiple paginated requests because the server only runs the
+# spatial query once.
+SINGLE_REQUEST_LIMIT = 99999
 
 # Standard region grid size for fast queries (degrees).
-# GFW indexes data spatially; large round regions hit the index better
-# than tight arbitrary polygons.  We query a broad region and filter
-# results client-side by port name / topDestination.
-STANDARD_REGION_DEG = 4.0
+# A 2° box is ~220 km across — large enough to cover any port area,
+# small enough to keep results manageable.
+STANDARD_REGION_DEG = 2.0
 
 
 def _get_token() -> str:
@@ -47,83 +49,38 @@ def _headers() -> dict[str, str]:
 # Port-visit events
 # ---------------------------------------------------------------------------
 
-def _standard_region_bbox(centre_lat: float, centre_lon: float) -> dict:
-    """
-    Return a large GeoJSON Polygon snapped to a standard grid.
-    This hits GFW spatial indices efficiently and returns fast.
-    Results are filtered client-side by port name afterwards.
-    """
-    half = STANDARD_REGION_DEG / 2
-    # Snap to grid
-    min_lat = max(-90, (centre_lat // half) * half - half)
-    max_lat = min(90, min_lat + STANDARD_REGION_DEG)
-    min_lon = max(-180, (centre_lon // half) * half - half)
-    max_lon = min(180, min_lon + STANDARD_REGION_DEG)
-    return {
-        "type": "Polygon",
-        "coordinates": [[
-            [min_lon, min_lat],
-            [max_lon, min_lat],
-            [max_lon, max_lat],
-            [min_lon, max_lat],
-            [min_lon, min_lat],
-        ]],
-    }
-
 
 def fetch_port_visits(
     geometry: dict,
     start_date: str,
     end_date: str,
-    centre_lat: Optional[float] = None,
-    centre_lon: Optional[float] = None,
     port_name: Optional[str] = None,
     vessels: Optional[list[str]] = None,
     flags: Optional[list[str]] = None,
     duration: Optional[int] = None,
-    limit: int = PAGE_SIZE,
-    max_pages: int = 20,
-    timeout: float = 120.0,
+    timeout: float = 60.0,
 ) -> list[dict[str, Any]]:
     """
-    Fetch port-visit events for a date range.
+    Fetch port-visit events in a **single** API call.
 
-    Strategy: if centre_lat/lon are provided, queries a broad standard
-    region (fast because it hits spatial indices), then filters results
-    client-side by port_name.  Falls back to the exact geometry if no
-    centre is provided.
+    Uses the tight bounding box derived from the anchorage/berth cells
+    (typically only a few km across).  All results are returned in one
+    request (limit=99999), no pagination needed.
 
     Parameters
     ----------
-    geometry : dict   GeoJSON Polygon (tight bbox — used as fallback)
+    geometry : dict   GeoJSON Polygon (tight bbox from port cells + pad)
     start_date, end_date : str  "YYYY-MM-DD"
-    centre_lat, centre_lon : optional port centroid for broad-region query
-    port_name : optional — filter results to this port name (topDestination)
-    vessels : optional list of GFW vessel IDs
-    flags : optional list of ISO-3 flag codes
-    duration : optional minimum duration in minutes
-    limit : page size
-    max_pages : safety cap on pagination
+    port_name : optional — further filter results by anchorage name
     timeout : per-request timeout in seconds
-
-    Returns
-    -------
-    list[dict]  — flat list of event dicts from all pages
     """
     url = f"{GFW_BASE}/events"
-    all_events: list[dict] = []
-
-    # Use broad standard region if we have a centroid (much faster)
-    if centre_lat is not None and centre_lon is not None:
-        query_geom = _standard_region_bbox(centre_lat, centre_lon)
-    else:
-        query_geom = geometry
 
     body: dict[str, Any] = {
         "datasets": [PORT_VISIT_DATASET],
         "startDate": start_date,
         "endDate": end_date,
-        "geometry": query_geom,
+        "geometry": geometry,
     }
     if vessels:
         body["vessels"] = vessels
@@ -132,32 +89,22 @@ def fetch_port_visits(
     if duration is not None:
         body["duration"] = duration
 
-    offset = 0
-    for _page in range(max_pages):
-        params = {"offset": offset, "limit": limit}
+    # Single request — no pagination loop
+    params = {"offset": 0, "limit": SINGLE_REQUEST_LIMIT}
+    resp = httpx.post(url, headers=_headers(), json=body, params=params, timeout=timeout)
+
+    if resp.status_code == 429:
+        retry_after = int(resp.headers.get("Retry-After", "10"))
+        time.sleep(retry_after)
         resp = httpx.post(url, headers=_headers(), json=body, params=params, timeout=timeout)
 
-        if resp.status_code == 429:
-            # Rate-limited — back off and retry once
-            retry_after = int(resp.headers.get("Retry-After", "10"))
-            time.sleep(retry_after)
-            resp = httpx.post(url, headers=_headers(), json=body, params=params, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
 
-        resp.raise_for_status()
-        data = resp.json()
-
-        entries = data.get("entries", data) if isinstance(data, dict) else data
-        if isinstance(entries, dict):
-            entries = entries.get("entries", [])
-        if not entries:
-            break
-
-        all_events.extend(entries)
-        if len(entries) < limit:
-            break  # last page
-        if len(all_events) >= MAX_EVENTS:
-            break  # safety cap
-        offset += limit
+    entries = data.get("entries", data) if isinstance(data, dict) else data
+    if isinstance(entries, dict):
+        entries = entries.get("entries", [])
+    all_events = entries if entries else []
 
     # --- Client-side filter by port name ---
     if port_name and all_events:

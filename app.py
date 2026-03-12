@@ -113,15 +113,13 @@ if selected_port:
 
     with col_fetch1:
         if st.button("🚢 Fetch port visits", type="primary"):
-            with st.spinner("Querying Global Fishing Watch … (broad region + port filter)"):
+            with st.spinner("Querying Global Fishing Watch …"):
                 try:
                     geometry = port_bounding_box(raw_cells, selected_port)
                     events = fetch_port_visits(
                         geometry=geometry,
                         start_date=str(start_date),
                         end_date=str(end_date),
-                        centre_lat=float(port_row["centroid_lat"]),
-                        centre_lon=float(port_row["centroid_lon"]),
                         port_name=selected_port,
                         duration=selection["min_stay_hours"] * 60,  # API expects minutes
                     )
@@ -158,7 +156,18 @@ if selected_port:
     # --- Render dashboards if data is in session ---
     if st.session_state.get("visits_port") == selected_port and "visits_df" in st.session_state:
         st.markdown("---")
-        render_visit_dashboard(st.session_state["visits_df"], selected_port)
+        vdf = st.session_state["visits_df"]
+        # Apply vessel-type filter (post-query, since GFW API doesn't support it)
+        selected_vtypes = selection.get("vessel_types", [])
+        if not vdf.empty and selected_vtypes and "vessel_type" in vdf.columns:
+            mask = vdf["vessel_type"].str.lower().isin([v.lower() for v in selected_vtypes])
+            vdf_filtered = vdf[mask]
+            n_excluded = len(vdf) - len(vdf_filtered)
+            if n_excluded:
+                st.caption(f"ℹ️ Showing {len(vdf_filtered)} of {len(vdf)} visits (filtered to: {', '.join(selected_vtypes)})")
+        else:
+            vdf_filtered = vdf
+        render_visit_dashboard(vdf_filtered, selected_port)
 
     if st.session_state.get("current_port") == selected_port and "current_ds" in st.session_state:
         st.markdown("---")
