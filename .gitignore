@@ -1,0 +1,12 @@
+.env
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+.venv/
+venv/
+data/cache/
+*.nc
+.copernicusmarine/
+*.egg-info/
+dist/
+build/
