@@ -117,7 +117,7 @@ def render_port_map(
         layers=layers,
         initial_view_state=view_state,
         tooltip=tooltip,
-        map_style="mapbox://styles/mapbox/light-v11",
+        map_style="road",
     )
 
     st.pydeck_chart(deck, height=height, width="stretch")

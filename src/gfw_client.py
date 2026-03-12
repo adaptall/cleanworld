@@ -13,6 +13,13 @@ import httpx
 GFW_BASE = "https://gateway.api.globalfishingwatch.org/v3"
 PORT_VISIT_DATASET = "public-global-port-visits-events:latest"
 PAGE_SIZE = 200  # events per page (GFW allows up to 99999 but large pages are slow)
+MAX_EVENTS = 2000  # safety cap on total events to avoid endless fetching
+
+# Standard region grid size for fast queries (degrees).
+# GFW indexes data spatially; large round regions hit the index better
+# than tight arbitrary polygons.  We query a broad region and filter
+# results client-side by port name / topDestination.
+STANDARD_REGION_DEG = 4.0
 
 
 def _get_token() -> str:
@@ -40,30 +47,62 @@ def _headers() -> dict[str, str]:
 # Port-visit events
 # ---------------------------------------------------------------------------
 
+def _standard_region_bbox(centre_lat: float, centre_lon: float) -> dict:
+    """
+    Return a large GeoJSON Polygon snapped to a standard grid.
+    This hits GFW spatial indices efficiently and returns fast.
+    Results are filtered client-side by port name afterwards.
+    """
+    half = STANDARD_REGION_DEG / 2
+    # Snap to grid
+    min_lat = max(-90, (centre_lat // half) * half - half)
+    max_lat = min(90, min_lat + STANDARD_REGION_DEG)
+    min_lon = max(-180, (centre_lon // half) * half - half)
+    max_lon = min(180, min_lon + STANDARD_REGION_DEG)
+    return {
+        "type": "Polygon",
+        "coordinates": [[
+            [min_lon, min_lat],
+            [max_lon, min_lat],
+            [max_lon, max_lat],
+            [min_lon, max_lat],
+            [min_lon, min_lat],
+        ]],
+    }
+
+
 def fetch_port_visits(
     geometry: dict,
     start_date: str,
     end_date: str,
+    centre_lat: Optional[float] = None,
+    centre_lon: Optional[float] = None,
+    port_name: Optional[str] = None,
     vessels: Optional[list[str]] = None,
     flags: Optional[list[str]] = None,
     duration: Optional[int] = None,
     limit: int = PAGE_SIZE,
-    max_pages: int = 100,
-    timeout: float = 60.0,
+    max_pages: int = 20,
+    timeout: float = 120.0,
 ) -> list[dict[str, Any]]:
     """
-    Fetch port-visit events inside a GeoJSON polygon for a date range.
+    Fetch port-visit events for a date range.
 
-    Handles pagination automatically (offset-based).
+    Strategy: if centre_lat/lon are provided, queries a broad standard
+    region (fast because it hits spatial indices), then filters results
+    client-side by port_name.  Falls back to the exact geometry if no
+    centre is provided.
 
     Parameters
     ----------
-    geometry : dict   GeoJSON Polygon
+    geometry : dict   GeoJSON Polygon (tight bbox — used as fallback)
     start_date, end_date : str  "YYYY-MM-DD"
+    centre_lat, centre_lon : optional port centroid for broad-region query
+    port_name : optional — filter results to this port name (topDestination)
     vessels : optional list of GFW vessel IDs
     flags : optional list of ISO-3 flag codes
     duration : optional minimum duration in minutes
-    limit : page size (default 50)
+    limit : page size
     max_pages : safety cap on pagination
     timeout : per-request timeout in seconds
 
@@ -74,11 +113,17 @@ def fetch_port_visits(
     url = f"{GFW_BASE}/events"
     all_events: list[dict] = []
 
+    # Use broad standard region if we have a centroid (much faster)
+    if centre_lat is not None and centre_lon is not None:
+        query_geom = _standard_region_bbox(centre_lat, centre_lon)
+    else:
+        query_geom = geometry
+
     body: dict[str, Any] = {
         "datasets": [PORT_VISIT_DATASET],
         "startDate": start_date,
         "endDate": end_date,
-        "geometry": geometry,
+        "geometry": query_geom,
     }
     if vessels:
         body["vessels"] = vessels
@@ -110,7 +155,24 @@ def fetch_port_visits(
         all_events.extend(entries)
         if len(entries) < limit:
             break  # last page
+        if len(all_events) >= MAX_EVENTS:
+            break  # safety cap
         offset += limit
+
+    # --- Client-side filter by port name ---
+    if port_name and all_events:
+        port_upper = port_name.upper()
+        filtered = []
+        for ev in all_events:
+            pv = ev.get("port_visit", {}) or {}
+            for anch_key in ("startAnchorage", "intermediateAnchorage", "endAnchorage"):
+                anch = pv.get(anch_key, {}) or {}
+                top_dest = (anch.get("topDestination") or "").upper()
+                anch_name = (anch.get("name") or "").upper()
+                if port_upper in (top_dest, anch_name):
+                    filtered.append(ev)
+                    break
+        return filtered
 
     return all_events
 

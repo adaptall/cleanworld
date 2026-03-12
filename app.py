@@ -113,17 +113,24 @@ if selected_port:
 
     with col_fetch1:
         if st.button("🚢 Fetch port visits", type="primary"):
-            with st.spinner("Querying Global Fishing Watch …"):
+            with st.spinner("Querying Global Fishing Watch … (broad region + port filter)"):
                 try:
                     geometry = port_bounding_box(raw_cells, selected_port)
                     events = fetch_port_visits(
                         geometry=geometry,
                         start_date=str(start_date),
                         end_date=str(end_date),
+                        centre_lat=float(port_row["centroid_lat"]),
+                        centre_lon=float(port_row["centroid_lon"]),
+                        port_name=selected_port,
                         duration=selection["min_stay_hours"] * 60,  # API expects minutes
                     )
                     records = parse_port_visits(events)
                     visits_df = pd.DataFrame(records)
+                    if visits_df.empty:
+                        st.warning("No port visits found for this selection.")
+                    else:
+                        st.success(f"Fetched {len(visits_df)} port-visit events.")
                     st.session_state["visits_df"] = visits_df
                     st.session_state["visits_port"] = selected_port
                 except Exception as e:
