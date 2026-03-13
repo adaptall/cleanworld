@@ -36,14 +36,46 @@ def _vessel_summary_table(df: pd.DataFrame) -> pd.DataFrame:
     ).reset_index()
 
     # Add enrichment columns if available
-    for col in ("tonnage_gt", "length_m", "imo"):
+    enrich_cols = [
+        "imo", "ship_type", "gross_tonnage", "deadweight_t",
+        "length_m", "beam_m", "year_built", "teu", "vf_name",
+    ]
+    for col in enrich_cols:
         if col in df.columns:
             first = df.dropna(subset=[col]).groupby("vessel_id")[col].first()
             agg = agg.merge(first, on="vessel_id", how="left")
 
+    # Use VesselFinder name if available (more reliable)
+    if "vf_name" in agg.columns:
+        agg["vessel_name"] = agg["vf_name"].fillna(agg["vessel_name"])
+
+    # Ship category for filtering: Container / Tanker / Bulk / Other
+    if "ship_type" in agg.columns:
+        agg["category"] = agg["ship_type"].apply(_classify_ship_type)
+
     agg["mean_stay_h"] = agg["mean_stay_h"].round(1)
     agg["total_hours"] = agg["total_hours"].round(1)
     return agg.sort_values("visits", ascending=False)
+
+
+def _classify_ship_type(ship_type: str | None) -> str:
+    """Map detailed VesselFinder ship type to broad category."""
+    if not ship_type:
+        return "Other"
+    st = ship_type.lower()
+    if "container" in st:
+        return "Container"
+    if "tanker" in st or "lng" in st or "lpg" in st or "chemical" in st:
+        return "Tanker"
+    if "bulk" in st:
+        return "Bulk Carrier"
+    if "cargo" in st or "general" in st:
+        return "Cargo"
+    if "passenger" in st or "cruise" in st or "ferry" in st or "ro-pax" in st:
+        return "Passenger"
+    if "tug" in st or "pilot" in st or "dredg" in st or "supply" in st or "offshore" in st:
+        return "Workboat"
+    return "Other"
 
 
 def render_visit_dashboard(visits_df: pd.DataFrame, port_name: str) -> None:
@@ -126,17 +158,72 @@ def render_visit_dashboard(visits_df: pd.DataFrame, port_name: str) -> None:
     st.subheader("🚢 Vessel summary")
     vessel_tbl = _vessel_summary_table(df)
     if not vessel_tbl.empty:
-        # Pick display columns based on what's available
-        display_cols = ["vessel_name", "vessel_type", "vessel_flag", "vessel_mmsi", "visits", "total_hours", "mean_stay_h"]
-        for extra in ("imo", "tonnage_gt", "length_m"):
+        # Build display columns dynamically
+        base_cols = ["vessel_name"]
+        # If enriched, show detailed columns
+        if "ship_type" in vessel_tbl.columns:
+            base_cols += ["category", "ship_type"]
+        else:
+            base_cols += ["vessel_type"]
+        base_cols += ["vessel_flag"]
+        for extra in ("gross_tonnage", "deadweight_t", "length_m", "beam_m", "year_built", "teu"):
             if extra in vessel_tbl.columns and vessel_tbl[extra].notna().any():
-                display_cols.insert(-3, extra)  # insert before visit stats
-        display_cols = [c for c in display_cols if c in vessel_tbl.columns]
+                base_cols.append(extra)
+        base_cols += ["visits", "total_hours", "mean_stay_h"]
+        if "imo" in vessel_tbl.columns and vessel_tbl["imo"].notna().any():
+            # Add VesselFinder link
+            vessel_tbl["details"] = vessel_tbl["imo"].apply(
+                lambda x: f"https://www.vesselfinder.com/vessels/details/{x}" if pd.notna(x) else ""
+            )
+            base_cols.append("details")
+        display_cols = [c for c in base_cols if c in vessel_tbl.columns]
+
+        # Category filter (if enriched)
+        if "category" in vessel_tbl.columns:
+            categories = sorted(vessel_tbl["category"].dropna().unique())
+            selected_cats = st.multiselect(
+                "Filter by ship category",
+                options=categories,
+                default=categories,
+                key="vessel_cat_filter",
+            )
+            if selected_cats:
+                vessel_tbl = vessel_tbl[vessel_tbl["category"].isin(selected_cats)]
+
+        # Size filter (if enriched)
+        if "gross_tonnage" in vessel_tbl.columns and vessel_tbl["gross_tonnage"].notna().any():
+            gt_col = vessel_tbl["gross_tonnage"].dropna()
+            min_gt, max_gt = int(gt_col.min()), int(gt_col.max())
+            if min_gt < max_gt:
+                gt_range = st.slider(
+                    "Gross tonnage range",
+                    min_value=min_gt,
+                    max_value=max_gt,
+                    value=(min_gt, max_gt),
+                    key="gt_filter",
+                )
+                vessel_tbl = vessel_tbl[
+                    vessel_tbl["gross_tonnage"].isna() |
+                    vessel_tbl["gross_tonnage"].between(gt_range[0], gt_range[1])
+                ]
+
         st.dataframe(
             vessel_tbl[display_cols],
             width="stretch",
             hide_index=True,
-            height=min(400, 35 * len(vessel_tbl) + 38),
+            height=min(500, 35 * len(vessel_tbl) + 38),
+            column_config={
+                "details": st.column_config.LinkColumn("VesselFinder", display_text="🔗 View"),
+                "gross_tonnage": st.column_config.NumberColumn("GT", format="%d"),
+                "deadweight_t": st.column_config.NumberColumn("DWT (t)", format="%d"),
+                "length_m": st.column_config.NumberColumn("Length (m)", format="%.1f"),
+                "beam_m": st.column_config.NumberColumn("Beam (m)", format="%.1f"),
+                "year_built": st.column_config.NumberColumn("Built", format="%d"),
+                "teu": st.column_config.NumberColumn("TEU", format="%d"),
+                "visits": "Visits",
+                "total_hours": st.column_config.NumberColumn("Total hrs", format="%.0f"),
+                "mean_stay_h": st.column_config.NumberColumn("Avg stay (h)", format="%.1f"),
+            },
         )
         st.caption(f"{len(vessel_tbl)} unique vessels · {int(vessel_tbl['visits'].sum())} total visits")
     else:

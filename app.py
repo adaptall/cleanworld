@@ -35,6 +35,8 @@ from src.port_data import (
     port_bbox_coords,
 )
 from src.gfw_client import fetch_port_visits, parse_port_visits, fetch_vessel_details_batch
+from src.vesselfinder import fetch_vessel_particulars
+from src.vessel_cache import get_many as cache_get_many, set_vessel as cache_set_vessel, cache_stats
 from src.copernicus_client import fetch_currents, add_speed_direction
 from src.analytics import site_score
 from src.utils import haversine_nm
@@ -170,20 +172,77 @@ if selected_port:
         render_visit_dashboard(vdf_filtered, selected_port)
 
         # --- Enrich vessel details button ---
-        if not vdf_filtered.empty and "tonnage_gt" not in vdf_filtered.columns:
-            if st.button("🔍 Enrich vessel details (tonnage, length, IMO)"):
+        if not vdf_filtered.empty and "gross_tonnage" not in vdf_filtered.columns:
+            if st.button("🔍 Enrich vessel details (type, tonnage, length)"):
+                # Phase 1: Get IMOs from GFW vessel API
                 unique_ids = vdf.loc[vdf["vessel_id"].notna(), "vessel_id"].unique().tolist()
-                if unique_ids:
-                    progress = st.progress(0, text=f"Fetching details for {len(unique_ids)} vessels…")
-                    def _update(i, total):
-                        progress.progress(i / total, text=f"Vessel {i}/{total}")
-                    details = fetch_vessel_details_batch(unique_ids, progress_callback=_update)
+                if not unique_ids:
+                    st.warning("No vessel IDs to enrich.")
+                else:
+                    status = st.empty()
+                    progress = st.progress(0, text="Phase 1: Fetching IMO numbers from GFW…")
+
+                    # Phase 1 — GFW: get IMO for each vessel_id
+                    status.info(f"Phase 1/2: Looking up IMO numbers for {len(unique_ids)} vessels…")
+                    def _gfw_progress(i, total):
+                        progress.progress(i / total * 0.4, text=f"GFW vessel {i}/{total}")
+                    gfw_details = fetch_vessel_details_batch(unique_ids, progress_callback=_gfw_progress)
+
+                    # Build IMO → vessel_id mapping
+                    imo_map: dict[str, str] = {}  # imo -> vessel_id
+                    for vid, det in gfw_details.items():
+                        imo = det.get("imo")
+                        if imo:
+                            imo_map[str(imo)] = vid
+
+                    # Phase 2 — VesselFinder: check cache, fetch missing
+                    all_imos = list(imo_map.keys())
+                    cached, missing_imos = cache_get_many(all_imos)
+                    status.info(
+                        f"Phase 2/2: {len(cached)} vessels cached, "
+                        f"fetching {len(missing_imos)} from VesselFinder…"
+                    )
+
+                    vf_results: dict[str, dict] = dict(cached)
+                    for i, imo in enumerate(missing_imos):
+                        pct = 0.4 + (i + 1) / max(len(missing_imos), 1) * 0.6
+                        progress.progress(pct, text=f"VesselFinder {i+1}/{len(missing_imos)}")
+                        info = fetch_vessel_particulars(imo)
+                        vf_results[imo] = info
+                        cache_set_vessel(imo, info)
+                        import time; time.sleep(0.8)  # polite delay
+
+                    progress.progress(1.0, text="Done!")
+
+                    # Merge enrichment into visits_df
+                    enrich_rows = []
+                    for imo, vf_data in vf_results.items():
+                        vid = imo_map.get(imo)
+                        if vid:
+                            row = {"vessel_id": vid}
+                            row["imo"] = imo
+                            row["gross_tonnage"] = vf_data.get("gross_tonnage")
+                            row["deadweight_t"] = vf_data.get("deadweight_t")
+                            row["length_m"] = vf_data.get("length_m")
+                            row["beam_m"] = vf_data.get("beam_m")
+                            row["year_built"] = vf_data.get("year_built")
+                            row["ship_type"] = vf_data.get("ship_type")
+                            row["teu"] = vf_data.get("teu")
+                            row["vf_name"] = vf_data.get("vessel_name")
+                            enrich_rows.append(row)
+
+                    if enrich_rows:
+                        edf = pd.DataFrame(enrich_rows)
+                        enriched = vdf.merge(edf, on="vessel_id", how="left")
+                        st.session_state["visits_df"] = enriched
+
+                    n_found = sum(1 for r in enrich_rows if r.get("gross_tonnage"))
+                    stats = cache_stats()
+                    status.success(
+                        f"Enriched {n_found}/{len(unique_ids)} vessels · "
+                        f"Cache: {stats['total_vessels']} vessels ({stats['size_mb']:.1f} MB)"
+                    )
                     progress.empty()
-                    # Merge into visits_df
-                    det_df = pd.DataFrame(details.values())
-                    enriched = vdf.merge(det_df, on="vessel_id", how="left")
-                    st.session_state["visits_df"] = enriched
-                    st.success(f"Enriched {len(det_df)} vessels with tonnage/length/IMO.")
                     st.rerun()
 
     if st.session_state.get("current_port") == selected_port and "current_ds" in st.session_state:
