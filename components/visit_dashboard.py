@@ -60,7 +60,7 @@ def _vessel_summary_table(df: pd.DataFrame) -> pd.DataFrame:
 
 def _classify_ship_type(ship_type: str | None) -> str:
     """Map detailed VesselFinder ship type to broad category."""
-    if not ship_type:
+    if not ship_type or not isinstance(ship_type, str):
         return "Other"
     st = ship_type.lower()
     if "container" in st:
