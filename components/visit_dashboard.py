@@ -17,6 +17,35 @@ from src.analytics import (
 )
 
 
+def _vessel_summary_table(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build a summary table: one row per unique vessel with visit count,
+    total hours, mean stay, and vessel details.
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    agg = df.groupby("vessel_id", dropna=False).agg(
+        vessel_name=("vessel_name", "first"),
+        vessel_type=("vessel_type", "first"),
+        vessel_flag=("vessel_flag", "first"),
+        vessel_mmsi=("vessel_mmsi", "first"),
+        visits=("event_id", "count"),
+        total_hours=("duration_hours", "sum"),
+        mean_stay_h=("duration_hours", "mean"),
+    ).reset_index()
+
+    # Add enrichment columns if available
+    for col in ("tonnage_gt", "length_m", "imo"):
+        if col in df.columns:
+            first = df.dropna(subset=[col]).groupby("vessel_id")[col].first()
+            agg = agg.merge(first, on="vessel_id", how="left")
+
+    agg["mean_stay_h"] = agg["mean_stay_h"].round(1)
+    agg["total_hours"] = agg["total_hours"].round(1)
+    return agg.sort_values("visits", ascending=False)
+
+
 def render_visit_dashboard(visits_df: pd.DataFrame, port_name: str) -> None:
     """Render the full visit analytics panel for a selected port."""
 
@@ -92,3 +121,23 @@ def render_visit_dashboard(visits_df: pd.DataFrame, port_name: str) -> None:
     if not vf.empty:
         with st.expander("Flag-state breakdown (top 15)"):
             st.dataframe(vf.head(15), width="stretch", hide_index=True)
+
+    # --- Vessel summary table ---
+    st.subheader("🚢 Vessel summary")
+    vessel_tbl = _vessel_summary_table(df)
+    if not vessel_tbl.empty:
+        # Pick display columns based on what's available
+        display_cols = ["vessel_name", "vessel_type", "vessel_flag", "vessel_mmsi", "visits", "total_hours", "mean_stay_h"]
+        for extra in ("imo", "tonnage_gt", "length_m"):
+            if extra in vessel_tbl.columns and vessel_tbl[extra].notna().any():
+                display_cols.insert(-3, extra)  # insert before visit stats
+        display_cols = [c for c in display_cols if c in vessel_tbl.columns]
+        st.dataframe(
+            vessel_tbl[display_cols],
+            width="stretch",
+            hide_index=True,
+            height=min(400, 35 * len(vessel_tbl) + 38),
+        )
+        st.caption(f"{len(vessel_tbl)} unique vessels · {int(vessel_tbl['visits'].sum())} total visits")
+    else:
+        st.info("No vessel data to summarise.")

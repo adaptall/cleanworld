@@ -34,7 +34,7 @@ from src.port_data import (
     port_bounding_box,
     port_bbox_coords,
 )
-from src.gfw_client import fetch_port_visits, parse_port_visits
+from src.gfw_client import fetch_port_visits, parse_port_visits, fetch_vessel_details_batch
 from src.copernicus_client import fetch_currents, add_speed_direction
 from src.analytics import site_score
 from src.utils import haversine_nm
@@ -168,6 +168,23 @@ if selected_port:
         else:
             vdf_filtered = vdf
         render_visit_dashboard(vdf_filtered, selected_port)
+
+        # --- Enrich vessel details button ---
+        if not vdf_filtered.empty and "tonnage_gt" not in vdf_filtered.columns:
+            if st.button("🔍 Enrich vessel details (tonnage, length, IMO)"):
+                unique_ids = vdf.loc[vdf["vessel_id"].notna(), "vessel_id"].unique().tolist()
+                if unique_ids:
+                    progress = st.progress(0, text=f"Fetching details for {len(unique_ids)} vessels…")
+                    def _update(i, total):
+                        progress.progress(i / total, text=f"Vessel {i}/{total}")
+                    details = fetch_vessel_details_batch(unique_ids, progress_callback=_update)
+                    progress.empty()
+                    # Merge into visits_df
+                    det_df = pd.DataFrame(details.values())
+                    enriched = vdf.merge(det_df, on="vessel_id", how="left")
+                    st.session_state["visits_df"] = enriched
+                    st.success(f"Enriched {len(det_df)} vessels with tonnage/length/IMO.")
+                    st.rerun()
 
     if st.session_state.get("current_port") == selected_port and "current_ds" in st.session_state:
         st.markdown("---")

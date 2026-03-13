@@ -144,6 +144,68 @@ def search_vessels(
     return resp.json().get("entries", [])
 
 
+def fetch_vessel_detail(vessel_id: str, timeout: float = 20.0) -> dict:
+    """
+    Fetch detailed vessel info (tonnage, length, IMO, etc.) from GFW.
+    Returns a flat dict with key fields.
+    """
+    url = f"{GFW_BASE}/vessels/{vessel_id}"
+    params = {"dataset": "public-global-vessel-identity:latest"}
+    try:
+        resp = httpx.get(url, headers=_headers(), params=params, timeout=timeout)
+        if resp.status_code == 429:
+            retry_after = int(resp.headers.get("Retry-After", "5"))
+            time.sleep(retry_after)
+            resp = httpx.get(url, headers=_headers(), params=params, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return {"vessel_id": vessel_id}
+
+    # Extract from registryInfo — take the latest record
+    registry = data.get("registryInfo", [])
+    best = {}
+    for entry in registry:
+        if entry.get("latestVesselInfo"):
+            best = entry
+            break
+    if not best and registry:
+        best = registry[-1]
+
+    return {
+        "vessel_id": vessel_id,
+        "imo": best.get("imo"),
+        "shipname": best.get("shipname"),
+        "callsign": best.get("callsign"),
+        "tonnage_gt": best.get("tonnageGt"),
+        "length_m": best.get("lengthM"),
+    }
+
+
+def fetch_vessel_details_batch(
+    vessel_ids: list[str],
+    max_concurrent: int = 5,
+    timeout: float = 15.0,
+    progress_callback=None,
+) -> dict[str, dict]:
+    """
+    Fetch vessel details for a list of IDs (sequential with rate-limit
+    awareness).  Returns {vessel_id: detail_dict}.
+
+    progress_callback(i, total) is called after each fetch if provided.
+    """
+    results: dict[str, dict] = {}
+    total = len(vessel_ids)
+    for i, vid in enumerate(vessel_ids):
+        results[vid] = fetch_vessel_detail(vid, timeout=timeout)
+        if progress_callback:
+            progress_callback(i + 1, total)
+        # Brief pause to respect rate limits
+        if (i + 1) % max_concurrent == 0:
+            time.sleep(0.5)
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Parse port-visit events into a flat table
 # ---------------------------------------------------------------------------
