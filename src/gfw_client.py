@@ -271,3 +271,137 @@ def parse_port_visits(events: list[dict]) -> list[dict]:
             "lon": pos.get("lon"),
         })
     return records
+
+
+# ---------------------------------------------------------------------------
+# Vessel port-visit history (global, per-vessel)
+# ---------------------------------------------------------------------------
+
+# Global bbox covering the whole world — used to anchor the spatial query
+# so the GFW server can use its spatial index efficiently.
+_GLOBAL_BBOX: dict = {
+    "type": "Polygon",
+    "coordinates": [[
+        [-180, -90], [180, -90], [180, 90], [-180, 90], [-180, -90],
+    ]],
+}
+
+
+def fetch_vessel_history(
+    vessel_ids: list[str],
+    start_date: str,
+    end_date: str,
+    batch_size: int = 10,
+    timeout: float = 60.0,
+    progress_callback=None,
+) -> list[dict]:
+    """
+    Fetch the global port-visit history for a list of vessels.
+
+    Uses the GFW events endpoint with a global bounding box and
+    ``vessels`` filter — this forces the server to use its spatial index
+    and returns results in ~6–25 s per batch.
+
+    Parameters
+    ----------
+    vessel_ids : list of GFW vessel ID strings
+    start_date, end_date : "YYYY-MM-DD"
+    batch_size : how many vessels per API call (default 10)
+    timeout : per-request timeout in seconds
+    progress_callback : optional (done, total) callable
+
+    Returns
+    -------
+    list of raw event dicts (same schema as ``fetch_port_visits``).
+    """
+    url = f"{GFW_BASE}/events"
+    all_events: list[dict] = []
+    total_batches = (len(vessel_ids) + batch_size - 1) // batch_size
+
+    for batch_idx in range(total_batches):
+        chunk = vessel_ids[batch_idx * batch_size : (batch_idx + 1) * batch_size]
+        body = {
+            "datasets": [PORT_VISIT_DATASET],
+            "startDate": start_date,
+            "endDate": end_date,
+            "vessels": chunk,
+            "geometry": _GLOBAL_BBOX,
+        }
+        params = {"offset": 0, "limit": SINGLE_REQUEST_LIMIT}
+
+        try:
+            resp = httpx.post(
+                url, headers=_headers(), json=body,
+                params=params, timeout=timeout,
+            )
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", "10"))
+                time.sleep(retry_after)
+                resp = httpx.post(
+                    url, headers=_headers(), json=body,
+                    params=params, timeout=timeout,
+                )
+            resp.raise_for_status()
+            data = resp.json()
+            entries = data.get("entries", [])
+            if isinstance(entries, dict):
+                entries = entries.get("entries", [])
+            all_events.extend(entries or [])
+        except Exception:
+            pass  # skip failed batches, continue
+
+        if progress_callback:
+            progress_callback(batch_idx + 1, total_batches)
+
+    return all_events
+
+
+def parse_vessel_history(events: list[dict]) -> dict[str, list[dict]]:
+    """
+    Parse raw history events into a ``{vessel_id: [visit_records]}`` dict.
+
+    Each visit record is a compact dict with: start, port_name, port_flag,
+    duration_hours, at_dock, lat, lon.  Sorted chronologically.
+    """
+    from collections import defaultdict
+
+    by_vessel: dict[str, list[dict]] = defaultdict(list)
+
+    for ev in events:
+        vessel = ev.get("vessel", {}) or {}
+        pv = ev.get("port_visit", {}) or {}
+        sa = pv.get("startAnchorage", {}) or {}
+        pos = ev.get("position", {}) or {}
+
+        vid = vessel.get("id")
+        if not vid:
+            continue
+
+        duration_h = pv.get("durationHrs")
+        start = ev.get("start")
+        end = ev.get("end")
+        if duration_h is None and start and end:
+            from datetime import datetime
+            try:
+                t0 = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                t1 = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                duration_h = (t1 - t0).total_seconds() / 3600
+            except Exception:
+                pass
+
+        by_vessel[vid].append({
+            "start": start,
+            "end": end,
+            "port_name": sa.get("name") or sa.get("topDestination") or "Unknown",
+            "port_flag": sa.get("flag") or "",
+            "duration_hours": duration_h,
+            "at_dock": sa.get("atDock"),
+            "lat": pos.get("lat"),
+            "lon": pos.get("lon"),
+        })
+
+    # Sort each vessel's visits chronologically
+    for vid in by_vessel:
+        by_vessel[vid].sort(key=lambda r: r.get("start") or "")
+
+    return dict(by_vessel)

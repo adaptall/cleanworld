@@ -34,9 +34,15 @@ from src.port_data import (
     port_bounding_box,
     port_bbox_coords,
 )
-from src.gfw_client import fetch_port_visits, parse_port_visits, fetch_vessel_details_batch
+from src.gfw_client import fetch_port_visits, parse_port_visits, fetch_vessel_details_batch, fetch_vessel_history, parse_vessel_history
 from src.vesselfinder import fetch_vessel_particulars
-from src.vessel_cache import get_many as cache_get_many, set_vessel as cache_set_vessel, cache_stats
+from src.vessel_cache import (
+    get_many as cache_get_many,
+    set_vessel as cache_set_vessel,
+    cache_stats,
+    get_many_histories,
+    set_vessel_history,
+)
 from src.copernicus_client import fetch_currents, add_speed_direction
 from src.analytics import site_score
 from src.utils import haversine_nm
@@ -45,6 +51,7 @@ from components.map_view import render_port_map, render_map_legend
 from components.sidebar import render_sidebar
 from components.visit_dashboard import render_visit_dashboard
 from components.current_dashboard import render_current_dashboard
+from components.history_dashboard import render_vessel_history
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -244,6 +251,92 @@ if selected_port:
                     )
                     progress.empty()
                     st.rerun()
+
+        # --- Vessel travel history button ---
+        if not vdf_filtered.empty and "vessel_id" in vdf_filtered.columns:
+            unique_vids = vdf_filtered.loc[
+                vdf_filtered["vessel_id"].notna(), "vessel_id"
+            ].unique().tolist()
+
+            # Compute lookback window: 3 months before the selected start_date
+            from datetime import timedelta
+            history_end = str(end_date)
+            history_start = str(start_date - timedelta(days=90))
+
+            if st.button("📍 Fetch vessel travel history"):
+                with st.spinner("Querying GFW for vessel travel history …"):
+                    status = st.empty()
+                    progress = st.progress(0, text="Checking cache…")
+
+                    # Check cache first
+                    cached_hist, missing_vids = get_many_histories(unique_vids)
+                    status.info(
+                        f"{len(cached_hist)} vessels cached, "
+                        f"fetching history for {len(missing_vids)}…"
+                    )
+
+                    if missing_vids:
+                        def _hist_progress(done, total):
+                            pct = (len(cached_hist) + done) / max(len(unique_vids), 1)
+                            progress.progress(
+                                min(pct, 1.0),
+                                text=f"GFW batch {done}/{total}",
+                            )
+
+                        raw_events = fetch_vessel_history(
+                            vessel_ids=missing_vids,
+                            start_date=history_start,
+                            end_date=history_end,
+                            batch_size=10,
+                            timeout=90.0,
+                            progress_callback=_hist_progress,
+                        )
+                        new_hist = parse_vessel_history(raw_events)
+
+                        # Store in cache
+                        for vid, visits in new_hist.items():
+                            set_vessel_history(vid, visits)
+
+                        # Merge with cached
+                        cached_hist.update(new_hist)
+
+                    # Also include vessels that had no events
+                    # (they exist in unique_vids but not in cached_hist)
+                    for vid in unique_vids:
+                        if vid not in cached_hist:
+                            cached_hist[vid] = []
+                            set_vessel_history(vid, [])
+
+                    # Store in session state
+                    st.session_state["vessel_history"] = cached_hist
+                    st.session_state["history_port"] = selected_port
+
+                    total_visits = sum(len(v) for v in cached_hist.values())
+                    progress.progress(1.0, text="Done!")
+                    status.success(
+                        f"Loaded travel history: {total_visits} port calls "
+                        f"across {len(cached_hist)} vessels"
+                    )
+                    progress.empty()
+
+        # --- Render vessel history dashboard ---
+        if (
+            st.session_state.get("history_port") == selected_port
+            and "vessel_history" in st.session_state
+        ):
+            st.markdown("---")
+            # Build vessel_id → name map from the visits DataFrame
+            vname_map = {}
+            for _, row in vdf_filtered.drop_duplicates("vessel_id").iterrows():
+                vid = row.get("vessel_id")
+                name = row.get("vf_name") or row.get("vessel_name") or vid
+                if vid:
+                    vname_map[vid] = name or vid
+            render_vessel_history(
+                st.session_state["vessel_history"],
+                vname_map,
+                selected_port,
+            )
 
     if st.session_state.get("current_port") == selected_port and "current_ds" in st.session_state:
         st.markdown("---")
